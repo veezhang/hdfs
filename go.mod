@@ -22,3 +22,5 @@ require (
 )
 
 go 1.17
+
+replace github.com/jcmturner/gokrb5/v8 => github.com/veezhang/gokrb5/v8 v8.0.0-20231225074733-cfe70e42e24f

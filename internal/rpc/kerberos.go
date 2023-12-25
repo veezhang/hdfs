@@ -24,17 +24,22 @@ var (
 
 func (c *NamenodeConnection) doKerberosHandshake() error {
 	// Start negotiation, and get the list of supported mechanisms in reply.
+	// spew.Printf("doKerberosHandshake: start\n")
 	err := c.writeSaslRequest(&hadoop.RpcSaslProto{
 		State: hadoop.RpcSaslProto_NEGOTIATE.Enum(),
 	})
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: writeSaslRequest NEGOTIATE failed %v\n", err)
 		return err
 	}
 
 	resp, err := c.readSaslResponse(hadoop.RpcSaslProto_NEGOTIATE)
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: readSaslResponse NEGOTIATE failed %v\n", err)
 		return err
 	}
+
+	// spew.Printf("doKerberosHandshake: readSaslResponse NEGOTIATE successfully. \n    resp: %+v\n", resp)
 
 	var krbAuth, tokenAuth *hadoop.RpcSaslProto_SaslAuth
 	for _, m := range resp.GetAuths() {
@@ -48,18 +53,23 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 	}
 
 	if krbAuth == nil {
+		// spew.Printf("doKerberosHandshake: errKerberosNotSupported\n")
 		return errKerberosNotSupported
 	}
 
 	// Get a ticket from Kerberos, and send the initial token to the namenode.
 	token, sessionKey, err := c.getKerberosTicket()
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: getKerberosTicket failed %v\n", err)
 		return err
 	}
+
+	// spew.Printf("doKerberosHandshake: getKerberosTicket successfully. \n    token %+v, \n    sessionKey %+v\n", token, sessionKey)
 
 	if tokenAuth != nil {
 		challenge, err := sasl.ParseChallenge(tokenAuth.Challenge)
 		if err != nil {
+			// spew.Printf("doKerberosHandshake: ParseChallenge failed %v\n", err)
 			return err
 		}
 
@@ -67,6 +77,8 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 		// return a malformed response otherwise.
 		sort.Sort(challenge.Qop)
 		qop := challenge.Qop[0]
+
+		// spew.Printf("doKerberosHandshake: ParseChallenge successfully. \n    challenge %+v\n", challenge)
 
 		switch qop {
 		case sasl.QopPrivacy, sasl.QopIntegrity:
@@ -91,37 +103,78 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 		Auths: []*hadoop.RpcSaslProto_SaslAuth{krbAuth},
 	})
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: writeSaslRequest INITIATE failed %v\n", err)
 		return err
 	}
 
 	// In response, we get a server token to verify.
 	resp, err = c.readSaslResponse(hadoop.RpcSaslProto_CHALLENGE)
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: readSaslResponse CHALLENGE failed %v\n", err)
 		return err
 	}
 
-	var nnToken gssapi.WrapToken
-	err = nnToken.Unmarshal(resp.GetToken(), true)
-	if err != nil {
-		return err
-	}
+	// spew.Printf("doKerberosHandshake: readSaslResponse CHALLENGE successfully.\n    resp %+v\n", resp)
 
-	_, err = nnToken.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SEAL)
-	if err != nil {
-		return fmt.Errorf("invalid server token: %s", err)
-	}
+	var signedBytes []byte
+	if len(resp.GetToken()) > 0 && resp.GetToken()[0] == 0x60 {
+		// spew.Printf("doKerberosHandshake: WrapTokenV1\n")
 
-	// Sign the payload and send it back to the namenode.
-	// TODO: Make sure we can support what is required based on what's in the
-	// payload.
-	signed, err := gssapi.NewInitiatorWrapToken(nnToken.Payload, sessionKey)
-	if err != nil {
-		return err
-	}
+		var nnToken gssapi.WrapTokenV1
+		if err = nnToken.Unmarshal(resp.GetToken(), true); err != nil {
+			// spew.Printf("doKerberosHandshake: WrapTokenV1 Unmarshal failed %v\n", err)
+			return err
+		}
 
-	signedBytes, err := signed.Marshal()
-	if err != nil {
-		return err
+		// spew.Printf("doKerberosHandshake: WrapTokenV1 Unmarshal successfully.\n    nnToken %+v\n", nnToken)
+
+		_, err = nnToken.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SIGN)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: WrapTokenV1 Verify failed %v\n", err)
+			return fmt.Errorf("invalid server token: %s", err)
+		}
+
+		signed, err := gssapi.NewInitiatorWrapTokenV1(&nnToken, sessionKey)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: NewInitiatorWrapTokenV1 failed %v\n", err)
+			return err
+		}
+
+		signedBytes, err = signed.Marshal(sessionKey)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: WrapTokenV1 Marshal failed %v\n", err)
+			return err
+		}
+	} else {
+		// spew.Printf("doKerberosHandshake: WrapToken\n")
+
+		var nnToken gssapi.WrapToken
+		err = nnToken.Unmarshal(resp.GetToken(), true)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: WrapToken Unmarshal failed %v\n", err)
+			return err
+		}
+
+		_, err = nnToken.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SEAL)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: WrapToken Verify failed %v\n", err)
+			return fmt.Errorf("invalid server token: %s", err)
+		}
+
+		// Sign the payload and send it back to the namenode.
+		// TODO: Make sure we can support what is required based on what's in the
+		// payload.
+		signed, err := gssapi.NewInitiatorWrapToken(nnToken.Payload, sessionKey)
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: NewInitiatorWrapToken failed %v\n", err)
+			return err
+		}
+
+		signedBytes, err = signed.Marshal()
+		if err != nil {
+			// spew.Printf("doKerberosHandshake: WrapToken Marshal failed %v\n", err)
+			return err
+		}
 	}
 
 	err = c.writeSaslRequest(&hadoop.RpcSaslProto{
@@ -129,11 +182,15 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 		Token: signedBytes,
 	})
 	if err != nil {
+		// spew.Printf("doKerberosHandshake: writeSaslRequest RESPONSE failed %v\n", err)
 		return err
 	}
 
 	// Read the final response. If it's a SUCCESS, then we're done here.
 	_, err = c.readSaslResponse(hadoop.RpcSaslProto_SUCCESS)
+	if err != nil {
+		// spew.Printf("doKerberosHandshake: readSaslResponse SUCCESS failed %v\n", err)
+	}
 	return err
 }
 
